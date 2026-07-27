@@ -15,6 +15,7 @@ internal sealed class FileWatchService : IDisposable
     private readonly object _gate = new();
     private readonly Dictionary<string, DirWatch> _dirs = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<Guid, WatchedFile> _files = new();
+    private readonly HashSet<Guid> _paused = new();
     private readonly Timer _healthPoll;
 
     public FileWatchService(BackupPipeline pipeline, ILogger<FileWatchService> log)
@@ -95,8 +96,21 @@ internal sealed class FileWatchService : IDisposable
             var name = Path.GetFileName(fullPath);
             if (!_dirs.TryGetValue(dir, out var dw)) return;
             if (!dw.NameToGuid.TryGetValue(name, out guid)) return;
+            if (_paused.Contains(guid)) return;
         }
         _pipeline.OnFileChanged(guid);
+    }
+
+    public void Pause(Guid guid)
+    {
+        lock (_gate) _paused.Add(guid);
+        _pipeline.MarkHealth(guid, FileHealth.Paused, null);
+    }
+
+    public void Resume(Guid guid)
+    {
+        lock (_gate) _paused.Remove(guid);
+        _pipeline.MarkHealth(guid, FileHealth.Watching, null);
     }
 
     private async void OnError(object? sender, ErrorEventArgs e)

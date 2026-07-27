@@ -3,7 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Keen.Forms;
 
-// 托盘优先:启动时不建主窗,在 ApplicationContext 里只挂 NotifyIcon。
+// 托盘优先:启动时不建主窗,只挂 NotifyIcon。
 // 启动时载入 DB 中的被监控文件、武装管线与 watcher;退出时干净停止(不变量⑤:DB 权威,关停有序)。
 internal sealed class TrayAppContext : ApplicationContext
 {
@@ -45,14 +45,22 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void ShowMain()
     {
-        // M3 接入 MainForm;M2 暂占位。
-        MessageBox.Show($"Keen 核心已就绪。当前监听由 DB 已有的被监控文件驱动(主窗 M3 实现后可增删)。",
-            "Keen", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        var main = _services.GetRequiredService<MainForm>();
+        if (main.WindowState == FormWindowState.Minimized) main.WindowState = FormWindowState.Normal;
+        if (!main.Visible) main.Show();
+        main.BringToFront();
+        main.Activate();
     }
 
     private void ExitApp()
     {
         _tray.Visible = false;
+        try
+        {
+            var main = _services.GetService<MainForm>();
+            if (main is not null) { main.AllowClose = true; main.Close(); }
+        }
+        catch { }
         try { ShutdownAsync().GetAwaiter().GetResult(); } catch { }
         ExitThread();
     }

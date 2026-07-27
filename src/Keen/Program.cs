@@ -71,6 +71,7 @@ internal static class Program
             sp.GetRequiredService<ILogger<BackupPipeline>>(),
             config.Current.SkipIdentical));
         services.AddSingleton<FileWatchService>();
+        services.AddSingleton<MainForm>();
         return services.BuildServiceProvider();
     }
 }

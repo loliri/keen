@@ -153,6 +153,19 @@ internal sealed class VaultIndex : IDisposable
         finally { _lock.Release(); }
     }
 
+    public async Task<long> CountVersionsAsync(Guid guid)
+    {
+        await _lock.WaitAsync();
+        try
+        {
+            using var c = _conn.CreateCommand();
+            c.CommandText = "SELECT COUNT(*) FROM version WHERE watched_guid=@g;";
+            c.Parameters.AddWithValue("@g", guid.ToString());
+            return (long)(await c.ExecuteScalarAsync())!;
+        }
+        finally { _lock.Release(); }
+    }
+
     public async Task<VersionEntry?> GetLastVersionAsync(Guid guid)
     {
         await _lock.WaitAsync();
