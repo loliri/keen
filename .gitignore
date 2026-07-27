@@ -1,0 +1,18 @@
+## .NET 构建产物
+bin/
+obj/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## ReSharper
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+## 日志(仅本地运行时产出,不入库)
+*.log
