@@ -13,6 +13,7 @@ internal sealed class MainForm : Form
     private readonly FileWatchService _watcher;
     private readonly VaultIndex _index;
     private readonly ConfigService _config;
+    private readonly IServiceProvider _sp;
 
     private readonly DataGridView _grid = new();
     private readonly BindingList<WatchedRow> _rows = new();
@@ -26,6 +27,7 @@ internal sealed class MainForm : Form
 
     public MainForm(IServiceProvider sp)
     {
+        _sp = sp;
         _pipeline = sp.GetRequiredService<BackupPipeline>();
         _watcher = sp.GetRequiredService<FileWatchService>();
         _index = sp.GetRequiredService<VaultIndex>();
@@ -209,8 +211,7 @@ internal sealed class MainForm : Form
     private void HistorySelected()
     {
         if (_grid.CurrentRow?.DataBoundItem is not WatchedRow row) return;
-        // M4: 打开 HistoryForm。
-        MessageBox.Show(this, $"版本历史(M4 实现):{row.DisplayName}", "Keen");
+        new HistoryForm(row.Guid, row.DisplayName, row.Path, _sp) { ShowInTaskbar = false }.Show(this);
     }
 
     private void TogglePause()

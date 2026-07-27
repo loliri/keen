@@ -9,6 +9,7 @@ namespace Keen.Services;
 // 5 段备份管线(不变量①~⑦)。每个被监控文件一个有界 Channel + 单消费者;全局 SemaphoreSlim(4) 节流。
 // ① 500ms 尾沿防抖 → ② 写静止/锁重试(20 次 ~30s)+ FileId 校验打开 → ④ 流复制+SHA256 → ⑤ 持久落库+插索引。
 // 消费循环内 try/catch,单个坏作业不杀消费线程。
+// CaptureDirectAsync:供恢复(PreRestoreSnapshot)等需要同步等待结果的特殊作业用,走同一通道串行。
 internal sealed class BackupPipeline : IDisposable
 {
     private readonly VaultStore _store;
@@ -20,7 +21,7 @@ internal sealed class BackupPipeline : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<Guid, FileState> _states = new();
     private readonly ConcurrentDictionary<Guid, Timer> _debounce = new();
-    private readonly Random _jitter = new(); // 重试抖动;仅在消费线程内用
+    private readonly Random _jitter = new();
 
     public event Action<VersionEntry>? VersionCaptured;
     public event Action<Guid, FileHealth, string?>? HealthChanged;
@@ -53,24 +54,31 @@ internal sealed class BackupPipeline : IDisposable
             SingleReader = true,
             SingleWriter = false,
         });
-        var last = await _index.GetLastVersionAsync(guid);
-        if (last is { } lv)
-        {
-            st.LastSha = lv.Sha256; st.LastSize = lv.SizeBytes; st.LastTicks = lv.CapturedAtTicks; st.Seq = lv.Seq;
-        }
+        await ReSeedStateAsync(st);
         if (_states.TryAdd(guid, st))
             st.Consumer = Task.Run(() => ConsumeAsync(st));
     }
 
-    public void Unregister(Guid guid) => EnqueueAndComplete(guid);
-
-    private void EnqueueAndComplete(Guid guid)
+    private async Task ReSeedStateAsync(FileState st)
     {
-        if (_states.TryGetValue(guid, out var st))
-            st.Channel.Writer.TryComplete();
+        var last = await _index.GetLastVersionAsync(st.Guid);
+        if (last is { } lv)
+        {
+            st.LastSha = lv.Sha256; st.LastSize = lv.SizeBytes; st.LastTicks = lv.CapturedAtTicks; st.Seq = lv.Seq;
+        }
     }
 
-    // FSW 事件入口:500ms 尾沿防抖,最后一次胜出。
+    // 恢复后/外部直接改了 DB 后,刷新某文件的内存基线。
+    public async Task ReSeedBaselineAsync(Guid guid)
+    {
+        if (_states.TryGetValue(guid, out var st)) await ReSeedStateAsync(st);
+    }
+
+    public void Unregister(Guid guid)
+    {
+        if (_states.TryGetValue(guid, out var st)) st.Channel.Writer.TryComplete();
+    }
+
     public void OnFileChanged(Guid guid)
     {
         if (!_states.TryGetValue(guid, out var st)) return;
@@ -92,7 +100,27 @@ internal sealed class BackupPipeline : IDisposable
             st.Channel.Writer.TryWrite(job);
     }
 
-    // watcher / 其它路径用它来直接设健康状态(UI 单一来源由此转发)。
+    // 同步等待结果的直接捕获(恢复前置快照用)。走同一通道,与正常作业串行。
+    public async Task<VersionEntry?> CaptureDirectAsync(Guid guid, string path, string displayName,
+        VersionKind kind, bool bypassDedupe, CancellationToken ct)
+    {
+        if (!_states.TryGetValue(guid, out var st))
+            throw new InvalidOperationException("文件未在管线注册: " + guid);
+        var tcs = new TaskCompletionSource<VersionEntry?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var job = new BackupJob
+        {
+            WatchedGuid = guid,
+            SourcePath = path,
+            DisplayName = displayName,
+            Kind = kind,
+            BypassDedupe = bypassDedupe,
+            Tcs = tcs,
+        };
+        if (!st.Channel.Writer.TryWrite(job)) return null;
+        using var reg = ct.Register(() => tcs.TrySetCanceled());
+        return await tcs.Task;
+    }
+
     public void MarkHealth(Guid guid, FileHealth h, string? msg) => HealthChanged?.Invoke(guid, h, msg);
 
     private async Task ConsumeAsync(FileState st)
@@ -100,17 +128,19 @@ internal sealed class BackupPipeline : IDisposable
         var token = _cts.Token;
         await foreach (var job in st.Channel.Reader.ReadAllAsync(token))
         {
-            try { await ProcessJobAsync(st, job); }
-            catch (OperationCanceledException) { return; }
+            VersionEntry? result = null;
+            try { result = await ProcessJobAsync(st, job); }
+            catch (OperationCanceledException) { job.Tcs?.TrySetCanceled(); return; }
             catch (Exception ex)
             {
                 _log.LogError(ex, "处理 {Guid} 的备份作业失败", st.Guid);
                 HealthChanged?.Invoke(st.Guid, FileHealth.Degraded, ex.Message);
             }
+            job.Tcs?.TrySetResult(result);
         }
     }
 
-    private async Task ProcessJobAsync(FileState st, BackupJob job)
+    private async Task<VersionEntry?> ProcessJobAsync(FileState st, BackupJob job)
     {
         await _globalThrottle.WaitAsync(_cts.Token);
         HealthChanged?.Invoke(st.Guid, FileHealth.Syncing, null);
@@ -122,15 +152,14 @@ internal sealed class BackupPipeline : IDisposable
                 try
                 {
                     var info = new FileInfo(job.SourcePath);
-                    if (!info.Exists) { HealthChanged?.Invoke(st.Guid, FileHealth.Missing, "源文件不存在"); return; }
+                    if (!info.Exists) { HealthChanged?.Invoke(st.Guid, FileHealth.Missing, "源文件不存在"); return null; }
 
-                    // 大文件(>100MB)写静止:2 样本长度稳定,≥1s。
                     if (info.Length > 100L << 20 && attempt == 0)
                     {
                         long s1 = info.Length;
                         await Task.Delay(1000, _cts.Token);
                         var info2 = new FileInfo(job.SourcePath);
-                        if (!info2.Exists) { HealthChanged?.Invoke(st.Guid, FileHealth.Missing, null); return; }
+                        if (!info2.Exists) { HealthChanged?.Invoke(st.Guid, FileHealth.Missing, null); return null; }
                         if (info2.Length != s1) { await Task.Delay(DelayFor(attempt), _cts.Token); continue; }
                     }
 
@@ -145,13 +174,12 @@ internal sealed class BackupPipeline : IDisposable
 
                     var copy = await _store.WriteBlobAsync(src, rel, progress: null, _cts.Token);
 
-                    // 去重(默认关;PreRestoreSnapshot 等永远 bypass)
                     if (!job.BypassDedupe && _skipIdentical && st.LastSha == copy.sha256)
                     {
                         _store.DeleteBlob(rel);
                         st.LastTicks = ticks;
                         HealthChanged?.Invoke(st.Guid, FileHealth.Watching, null);
-                        return;
+                        return null;
                     }
 
                     var entry = await _index.InsertVersionAsync(st.Guid, ticks, seq, job.Kind, rel,
@@ -159,10 +187,10 @@ internal sealed class BackupPipeline : IDisposable
                     st.Seq = seq; st.LastSha = copy.sha256; st.LastSize = copy.size; st.LastTicks = ticks;
                     VersionCaptured?.Invoke(entry);
                     HealthChanged?.Invoke(st.Guid, FileHealth.Watching, null);
-                    return;
+                    return entry;
                 }
-                catch (FileNotFoundException) { HealthChanged?.Invoke(st.Guid, FileHealth.Missing, null); return; }
-                catch (OperationCanceledException) { return; }
+                catch (FileNotFoundException) { HealthChanged?.Invoke(st.Guid, FileHealth.Missing, null); return null; }
+                catch (OperationCanceledException) { throw; }
                 catch (StaleHandleException) when (attempt < maxAttempts - 1) { await Task.Delay(DelayFor(attempt), _cts.Token); }
                 catch (IOException ex) when (attempt < maxAttempts - 1)
                 {
@@ -171,6 +199,7 @@ internal sealed class BackupPipeline : IDisposable
                 }
             }
             HealthChanged?.Invoke(st.Guid, FileHealth.Failing, "重试耗尽");
+            return null;
         }
         finally
         {
