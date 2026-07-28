@@ -8,12 +8,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Version>0.1.0</Version>
 
-    <!-- 自包含单文件 exe(WPF/WinForms 不可裁剪) -->
+    <!-- 自包含多文件(可差量更新:只换变化的 DLL,通常 Keen.dll);WinForms 不可裁剪 -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
-    <PublishSingleFile>true</PublishSingleFile>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <PublishSingleFile>false</PublishSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
 
