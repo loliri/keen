@@ -10,25 +10,32 @@ namespace Keen.Services;
 // ① 500ms 尾沿防抖 → ② 写静止/锁重试(20 次 ~30s)+ FileId 校验打开 → ④ 流复制+SHA256 → ⑤ 持久落库+插索引。
 // 消费循环内 try/catch,单个坏作业不杀消费线程。
 // CaptureDirectAsync:供恢复(PreRestoreSnapshot)等需要同步等待结果的特殊作业用,走同一通道串行。
+// 失败标记(#3):重试耗尽的作业留 marker,由 _failureRetry 定时重投,补 AV 锁静默丢版的洞。
 internal sealed class BackupPipeline : IDisposable
 {
     private readonly VaultStore _store;
     private readonly VaultIndex _index;
     private readonly ILogger<BackupPipeline> _log;
-    private readonly bool _skipIdentical;
+    private volatile bool _skipIdentical;
 
     private readonly SemaphoreSlim _globalThrottle = new(4);
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<Guid, FileState> _states = new();
     private readonly ConcurrentDictionary<Guid, Timer> _debounce = new();
     private readonly Random _jitter = new();
+    private readonly ConcurrentDictionary<Guid, FailureMarker> _failures = new();
+    private readonly Timer _failureRetry;
 
     public event Action<VersionEntry>? VersionCaptured;
     public event Action<Guid, FileHealth, string?>? HealthChanged;
+    // 捕获失败(重试耗尽)时触发,供通知用
+    public event Action<Guid, string>? CaptureFailed;
 
     public BackupPipeline(VaultStore store, VaultIndex index, ILogger<BackupPipeline> log, bool skipIdentical)
     {
         _store = store; _index = index; _log = log; _skipIdentical = skipIdentical;
+        _failureRetry = new Timer(_ => RetryFailures(), null,
+            TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
 
     private sealed class FileState
@@ -43,6 +50,16 @@ internal sealed class BackupPipeline : IDisposable
         public string? LastSha;
         public long LastSize;
     }
+
+    internal sealed class FailureMarker
+    {
+        public Guid Guid;
+        public string Path = "";
+        public string DisplayName = "";
+        public string Error = "";
+    }
+
+    public void SetSkipIdentical(bool value) => _skipIdentical = value;
 
     public async Task RegisterAsync(Guid guid, string path, string displayName)
     {
@@ -68,7 +85,6 @@ internal sealed class BackupPipeline : IDisposable
         }
     }
 
-    // 恢复后/外部直接改了 DB 后,刷新某文件的内存基线。
     public async Task ReSeedBaselineAsync(Guid guid)
     {
         if (_states.TryGetValue(guid, out var st)) await ReSeedStateAsync(st);
@@ -77,6 +93,7 @@ internal sealed class BackupPipeline : IDisposable
     public void Unregister(Guid guid)
     {
         if (_states.TryGetValue(guid, out var st)) st.Channel.Writer.TryComplete();
+        _failures.TryRemove(guid, out _);
     }
 
     public void OnFileChanged(Guid guid)
@@ -100,7 +117,6 @@ internal sealed class BackupPipeline : IDisposable
             st.Channel.Writer.TryWrite(job);
     }
 
-    // 同步等待结果的直接捕获(恢复前置快照用)。走同一通道,与正常作业串行。
     public async Task<VersionEntry?> CaptureDirectAsync(Guid guid, string path, string displayName,
         VersionKind kind, bool bypassDedupe, CancellationToken ct)
     {
@@ -122,6 +138,14 @@ internal sealed class BackupPipeline : IDisposable
     }
 
     public void MarkHealth(Guid guid, FileHealth h, string? msg) => HealthChanged?.Invoke(guid, h, msg);
+
+    // 周期性重投失败标记,让被 AV 锁等临时原因弄丢的版本有机会补上。
+    private void RetryFailures()
+    {
+        if (_failures.IsEmpty) return;
+        foreach (var (guid, m) in _failures)
+            Enqueue(new BackupJob { WatchedGuid = guid, SourcePath = m.Path, DisplayName = m.DisplayName });
+    }
 
     private async Task ConsumeAsync(FileState st)
     {
@@ -152,20 +176,30 @@ internal sealed class BackupPipeline : IDisposable
                 try
                 {
                     var info = new FileInfo(job.SourcePath);
-                    if (!info.Exists) { HealthChanged?.Invoke(st.Guid, FileHealth.Missing, "源文件不存在"); return null; }
+                    if (!info.Exists)
+                    {
+                        HealthChanged?.Invoke(st.Guid, FileHealth.Missing, "源文件不存在");
+                        _failures.TryRemove(st.Guid, out _);
+                        return null;
+                    }
 
                     if (info.Length > 100L << 20 && attempt == 0)
                     {
                         long s1 = info.Length;
                         await Task.Delay(1000, _cts.Token);
                         var info2 = new FileInfo(job.SourcePath);
-                        if (!info2.Exists) { HealthChanged?.Invoke(st.Guid, FileHealth.Missing, null); return null; }
+                        if (!info2.Exists)
+                        {
+                            HealthChanged?.Invoke(st.Guid, FileHealth.Missing, null);
+                            _failures.TryRemove(st.Guid, out _);
+                            return null;
+                        }
                         if (info2.Length != s1) { await Task.Delay(DelayFor(attempt), _cts.Token); continue; }
                     }
 
                     using var src = SourceFile.OpenVerified(job.SourcePath);
 
-                    int seq = st.Seq + 1; // 暂定;成功才提交
+                    int seq = st.Seq + 1;
                     long ticks = Math.Max(st.LastTicks, DateTime.UtcNow.Ticks);
                     if (ticks <= st.LastTicks) ticks = st.LastTicks + 1;
                     var month = new DateTime(ticks, DateTimeKind.Utc).ToString("yyyy-MM");
@@ -178,6 +212,7 @@ internal sealed class BackupPipeline : IDisposable
                     {
                         _store.DeleteBlob(rel);
                         st.LastTicks = ticks;
+                        _failures.TryRemove(st.Guid, out _);
                         HealthChanged?.Invoke(st.Guid, FileHealth.Watching, null);
                         return null;
                     }
@@ -185,11 +220,17 @@ internal sealed class BackupPipeline : IDisposable
                     var entry = await _index.InsertVersionAsync(st.Guid, ticks, seq, job.Kind, rel,
                         job.SourcePath, job.DisplayName, copy.size, copy.sha256);
                     st.Seq = seq; st.LastSha = copy.sha256; st.LastSize = copy.size; st.LastTicks = ticks;
+                    _failures.TryRemove(st.Guid, out _);
                     VersionCaptured?.Invoke(entry);
                     HealthChanged?.Invoke(st.Guid, FileHealth.Watching, null);
                     return entry;
                 }
-                catch (FileNotFoundException) { HealthChanged?.Invoke(st.Guid, FileHealth.Missing, null); return null; }
+                catch (FileNotFoundException)
+                {
+                    HealthChanged?.Invoke(st.Guid, FileHealth.Missing, null);
+                    _failures.TryRemove(st.Guid, out _);
+                    return null;
+                }
                 catch (OperationCanceledException) { throw; }
                 catch (StaleHandleException) when (attempt < maxAttempts - 1) { await Task.Delay(DelayFor(attempt), _cts.Token); }
                 catch (IOException ex) when (attempt < maxAttempts - 1)
@@ -198,7 +239,10 @@ internal sealed class BackupPipeline : IDisposable
                     await Task.Delay(DelayFor(attempt), _cts.Token);
                 }
             }
-            HealthChanged?.Invoke(st.Guid, FileHealth.Failing, "重试耗尽");
+            // 重试耗尽:留失败标记,等 _failureRetry 重投;通知 + 健康降级。
+            _failures[st.Guid] = new FailureMarker { Guid = st.Guid, Path = job.SourcePath, DisplayName = job.DisplayName, Error = "重试耗尽" };
+            HealthChanged?.Invoke(st.Guid, FileHealth.Failing, "重试耗尽,等待自动重投");
+            CaptureFailed?.Invoke(st.Guid, job.DisplayName);
             return null;
         }
         finally
@@ -225,6 +269,7 @@ internal sealed class BackupPipeline : IDisposable
 
     public void Dispose()
     {
+        _failureRetry.Dispose();
         _cts.Dispose();
         _globalThrottle.Dispose();
     }

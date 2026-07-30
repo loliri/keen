@@ -7,8 +7,8 @@ using Microsoft.Win32;
 namespace Keen.Forms;
 
 // 托盘优先:启动时不建主窗,只挂 NotifyIcon。
-// 启动时载入 DB 中的被监控文件、武装管线与 watcher;退出时干净停止(不变量⑤:DB 权威,关停有序)。
-// 托盘图标随聚合健康状态切换(任一 Failing/Degraded/Missing → error 图标)。
+// 启动时武装被监控文件(WatchService)、开命名管道服务接收右键菜单的 --add;
+// 退出走 async void、不阻塞 UI 线程,关停各后台件带超时,避免「退出变崩溃」。
 internal sealed class TrayAppContext : ApplicationContext
 {
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -16,10 +16,16 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private readonly ServiceProvider _services;
     private readonly NotifyIcon _tray;
-    private readonly Form _invoker;            // 隐藏,仅作 UI 线程封送目标
+    private readonly Form _invoker;
     private readonly SynchronizationContext _ui;
     private readonly Dictionary<Guid, FileHealth> _health = new();
     private readonly ToolStripMenuItem _autoItem;
+    private readonly ToolStripMenuItem _shellItem;
+    private readonly CancellationTokenSource _ipcCts = new();
+    private Task? _ipcTask;
+    private MainForm? _main;        // 仅在 ShowMain 真正创建后赋值;退出时只动它
+    private bool _exiting;
+    private bool _disposed;
 
     public TrayAppContext(ServiceProvider services)
     {
@@ -28,18 +34,30 @@ internal sealed class TrayAppContext : ApplicationContext
         _ui = SynchronizationContext.Current ?? new SynchronizationContext();
 
         _autoItem = new ToolStripMenuItem("开机自启") { Checked = IsAutostartOn() };
+        _shellItem = new ToolStripMenuItem("Explorer 右键:用 Keen 监控") { Checked = ShellIntegration.IsRegistered() };
 
         var menu = new ContextMenuStrip();
         menu.Items.Add("显示主窗(&S)", image: null, (_, _) => ShowMain());
+        menu.Items.Add("设置(&E)…", image: null, (_, _) => new SettingsForm(_services).ShowDialog());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_autoItem);
+        menu.Items.Add(_shellItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出 Keen(&X)", image: null, (_, _) => ExitApp());
-        _autoItem.Click += (_, _) =>
+
+        _autoItem.Click += (_, _) => { SetAutostart(!_autoItem.Checked); _autoItem.Checked = IsAutostartOn(); };
+        _shellItem.Click += (_, _) =>
         {
-            var wantOn = !_autoItem.Checked;
-            SetAutostart(wantOn);
-            _autoItem.Checked = IsAutostartOn();
+            try
+            {
+                if (_shellItem.Checked) ShellIntegration.Unregister();
+                else ShellIntegration.Register();
+                _shellItem.Checked = ShellIntegration.IsRegistered();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("切换右键菜单失败:" + ex.Message, "Keen", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         };
 
         _tray = new NotifyIcon
@@ -52,19 +70,27 @@ internal sealed class TrayAppContext : ApplicationContext
         _tray.DoubleClick += (_, _) => ShowMain();
     }
 
-    public async Task StartupAsync()
+    public async Task StartupAsync(string? addPath)
     {
         var pipeline = _services.GetRequiredService<BackupPipeline>();
-        var watcher = _services.GetRequiredService<FileWatchService>();
-        var index = _services.GetRequiredService<VaultIndex>();
-
+        var watches = _services.GetRequiredService<WatchService>();
         pipeline.HealthChanged += OnHealth;
-        var files = await index.LoadActiveWatchedFilesAsync();
-        foreach (var wf in files)
+        pipeline.CaptureFailed += OnCaptureFailed;
+
+        await watches.InitializeAsync();
+
+        _ipcTask = Task.Run(() => IpcService.RunServerAsync(OnIpcPath, _ipcCts.Token));
+
+        if (addPath is not null)
         {
-            await pipeline.RegisterAsync(wf.Guid, wf.CurrentPath, wf.DisplayName);
-            watcher.Add(wf);
+            try { await watches.AddFileAsync(addPath); } catch { }
         }
+    }
+
+    private async Task OnIpcPath(string path)
+    {
+        var watches = _services.GetRequiredService<WatchService>();
+        try { await watches.AddFileAsync(path); } catch { }
     }
 
     private void OnHealth(Guid guid, FileHealth h, string? msg) =>
@@ -76,37 +102,62 @@ internal sealed class TrayAppContext : ApplicationContext
             _tray.Icon = anyBad ? TrayIcon.Error : TrayIcon.Idle;
         }, null);
 
+    private void OnCaptureFailed(Guid guid, string name) =>
+        _ui.Post(_ =>
+        {
+            try
+            {
+                var cfg = _services.GetRequiredService<ConfigService>();
+                if (cfg.Current.NotifyOnFailure)
+                    _tray.ShowBalloonTip(5000, "Keen:存版失败",
+                        $"{name}\n捕获失败,将在稍后自动重试。", ToolTipIcon.Warning);
+            }
+            catch { }
+        }, null);
+
     private void ShowMain()
     {
-        var main = _services.GetRequiredService<MainForm>();
-        if (main.WindowState == FormWindowState.Minimized) main.WindowState = FormWindowState.Normal;
-        if (!main.Visible) main.Show();
-        main.BringToFront();
-        main.Activate();
+        _main = _services.GetRequiredService<MainForm>();
+        if (_main.WindowState == FormWindowState.Minimized) _main.WindowState = FormWindowState.Normal;
+        if (!_main.Visible) _main.Show();
+        _main.BringToFront();
+        _main.Activate();
     }
 
-    private void ExitApp()
+    // async void:菜单 Click 回调,不阻塞 UI 线程。各步独立 try/catch,任何一处崩都不影响后续。
+    private async void ExitApp()
     {
-        _tray.Visible = false;
-        try
-        {
-            var main = _services.GetService<MainForm>();
-            if (main is not null) { main.AllowClose = true; main.Close(); }
-        }
-        catch { }
-        try { ShutdownAsync().GetAwaiter().GetResult(); } catch { }
-        ExitThread();
+        if (_exiting) return;
+        _exiting = true;
+
+        try { _tray.Visible = false; } catch { }
+
+        // 只在主窗确实被打开过时才关它;避免在关停期凭空构造一个 Form。
+        try { if (_main is not null) { _main.AllowClose = true; _main.Close(); } } catch { }
+
+        // 关停后台件,带超时:卡住也最多等几秒就放行(进程反正要退)。
+        try { await ShutdownAsync(); } catch { }
+
+        try { ExitThread(); } catch { }
     }
 
     private async Task ShutdownAsync()
     {
         var pipeline = _services.GetRequiredService<BackupPipeline>();
-        var watcher = _services.GetRequiredService<FileWatchService>();
-        var index = _services.GetRequiredService<VaultIndex>();
-        pipeline.HealthChanged -= OnHealth;
-        try { await pipeline.StopAsync(); } catch { }
-        watcher.Dispose();
-        index.Dispose();
+        try { pipeline.HealthChanged -= OnHealth; pipeline.CaptureFailed -= OnCaptureFailed; } catch { }
+
+        _ipcCts.Cancel();
+        try { if (_ipcTask is not null) await Task.WhenAny(_ipcTask, Task.Delay(TimeSpan.FromSeconds(2))); }
+        catch { }
+
+        try
+        {
+            var stop = pipeline.StopAsync();
+            await Task.WhenAny(stop, Task.Delay(TimeSpan.FromSeconds(3)));
+        }
+        catch { }
+
+        // index / watcher / pipeline 的 Dispose 统一交给容器在 Dispose(disposing) 里做,避免双重释放。
     }
 
     private static bool IsAutostartOn()
@@ -124,11 +175,14 @@ internal sealed class TrayAppContext : ApplicationContext
 
     protected override void Dispose(bool disposing)
     {
+        if (_disposed) return;
+        _disposed = true;
         if (disposing)
         {
-            _tray.Dispose();
-            _invoker.Dispose();
-            _services.Dispose();
+            try { _ipcCts.Dispose(); } catch { }
+            try { _tray.Dispose(); } catch { }
+            try { _invoker.Dispose(); } catch { }
+            try { _services.Dispose(); } catch { }
         }
         base.Dispose(disposing);
     }

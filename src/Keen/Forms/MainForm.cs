@@ -10,18 +10,19 @@ namespace Keen.Forms;
 internal sealed class MainForm : Form
 {
     private readonly BackupPipeline _pipeline;
-    private readonly FileWatchService _watcher;
     private readonly VaultIndex _index;
-    private readonly ConfigService _config;
+    private readonly WatchService _watches;
     private readonly IServiceProvider _sp;
 
     private readonly DataGridView _grid = new();
     private readonly BindingList<WatchedRow> _rows = new();
     private readonly Button _add = new() { Text = "添加文件…" };
-    private readonly Button _remove = new() { Text = "移除" };
+    private readonly Button _remove = new() { Text = "停止监控" };
     private readonly Button _open = new() { Text = "打开" };
     private readonly Button _history = new() { Text = "历史…" };
-    private readonly Button _pause = new() { Text = "暂停/恢复" };
+    private readonly Button _reactivate = new() { Text = "重新监控" };
+    private readonly Button _purge = new() { Text = "彻底删除" };
+    private readonly Button _stats = new() { Text = "统计" };
 
     public bool AllowClose;
 
@@ -29,20 +30,22 @@ internal sealed class MainForm : Form
     {
         _sp = sp;
         _pipeline = sp.GetRequiredService<BackupPipeline>();
-        _watcher = sp.GetRequiredService<FileWatchService>();
         _index = sp.GetRequiredService<VaultIndex>();
-        _config = sp.GetRequiredService<ConfigService>();
+        _watches = sp.GetRequiredService<WatchService>();
 
         Text = "Keen · 被监控文件";
-        Width = 920; Height = 560;
+        Width = 980; Height = 580;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimizeBox = false;
         ShowInTaskbar = true;
 
         BuildUi();
 
         _pipeline.VersionCaptured += OnVersionCaptured;
         _pipeline.HealthChanged += OnHealthChanged;
+        _watches.FileAdded += OnFileAdded;
+        _watches.FileReactivated += OnFileReactivated;
+        _watches.FileDeactivated += OnFileDeactivated;
+        _watches.FileRemoved += OnFileRemoved;
 
         Load += async (_, _) => await LoadRowsAsync();
     }
@@ -56,8 +59,9 @@ internal sealed class MainForm : Form
             Padding = new Padding(8, 6, 8, 0),
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
+            AutoScroll = true,
         };
-        foreach (var b in new[] { _add, _remove, _open, _history, _pause })
+        foreach (var b in new[] { _add, _remove, _open, _history, _reactivate, _purge, _stats })
         {
             b.Margin = new Padding(0, 0, 8, 0);
             b.AutoSize = true;
@@ -72,6 +76,9 @@ internal sealed class MainForm : Form
         _grid.RowHeadersVisible = false;
         _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
         _grid.MultiSelect = false;
+        _grid.EnableHeadersVisualStyles = false; // #2 表头跟随深/浅色
+        _grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(0, 90, 158);
+        _grid.DefaultCellStyle.SelectionForeColor = Color.White;
         _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         AddCol("文件", nameof(WatchedRow.DisplayName), 160);
         AddCol("路径", nameof(WatchedRow.Path), 300);
@@ -81,7 +88,6 @@ internal sealed class MainForm : Form
         AddCol("大小", nameof(WatchedRow.SizeDisplay), 80);
         _grid.DataSource = _rows;
 
-        // 顺序:Fill 控件先加(在顶部 dock 下方)。
         Controls.Add(_grid);
         Controls.Add(bar);
 
@@ -89,7 +95,22 @@ internal sealed class MainForm : Form
         _remove.Click += (_, _) => Remove();
         _open.Click += (_, _) => OpenSelected();
         _history.Click += (_, _) => HistorySelected();
-        _pause.Click += (_, _) => TogglePause();
+        _reactivate.Click += (_, _) => _ = _watches.ReactivateAsync(SelectedGuid());
+        _purge.Click += (_, _) => Purge();
+        _stats.Click += async (_, _) => await StatsAsync();
+        _grid.SelectionChanged += (_, _) => UpdateButtonStates();
+        _grid.CellDoubleClick += (_, e) => OnCellDoubleClicked(e);
+
+        // #5 拖拽:把文件拖进主窗直接添加
+        AllowDrop = true;
+        DragEnter += (_, e) => e.Effect = e.Data?.GetDataPresent(DataFormats.FileDrop) == true ? DragDropEffects.Copy : DragDropEffects.None;
+        DragDrop += async (_, e) =>
+        {
+            if (e.Data?.GetData(DataFormats.FileDrop) is string[] files)
+                foreach (var f in files) await _watches.AddFileAsync(f);
+        };
+
+        UpdateButtonStates();
     }
 
     private void AddCol(string header, string prop, int width) =>
@@ -102,9 +123,25 @@ internal sealed class MainForm : Form
             FillWeight = width,
         });
 
+    private Guid SelectedGuid() => (_grid.CurrentRow?.DataBoundItem as WatchedRow)?.Guid ?? Guid.Empty;
+
+    private void UpdateButtonStates()
+    {
+        var row = _grid.CurrentRow?.DataBoundItem as WatchedRow;
+        if (row is null)
+        {
+            _remove.Enabled = _open.Enabled = _history.Enabled = _reactivate.Enabled = _purge.Enabled = false;
+            return;
+        }
+        _remove.Enabled = _open.Enabled = row.IsActive;
+        _history.Enabled = true;
+        _reactivate.Enabled = !row.IsActive;
+        _purge.Enabled = !row.IsActive;
+    }
+
     private async Task LoadRowsAsync()
     {
-        var files = await _index.LoadActiveWatchedFilesAsync();
+        var files = await _index.LoadAllWatchedFilesAsync();
         foreach (var wf in files)
         {
             var count = await _index.CountVersionsAsync(wf.Guid);
@@ -114,11 +151,24 @@ internal sealed class MainForm : Form
                 Guid = wf.Guid,
                 DisplayName = wf.DisplayName,
                 Path = wf.CurrentPath,
+                IsActiveField = wf.IsActive,
                 VersionCountField = count,
                 LastCapturedTicksField = last?.CapturedAtTicks ?? 0,
                 SizeBytesField = last?.SizeBytes ?? 0,
                 HealthField = FileHealth.Watching,
             });
+        }
+        RefreshRowStyles();
+        UpdateButtonStates();
+    }
+
+    // 已移除的行灰显。
+    private void RefreshRowStyles()
+    {
+        foreach (DataGridViewRow r in _grid.Rows)
+        {
+            if (r.DataBoundItem is WatchedRow wr)
+                r.DefaultCellStyle.ForeColor = wr.IsActive ? Color.Empty : Color.Gray;
         }
     }
 
@@ -142,6 +192,52 @@ internal sealed class MainForm : Form
             if (row is not null) row.HealthField = h;
         });
 
+    private void OnFileAdded(WatchedFile wf) =>
+        BeginInvoke(() =>
+        {
+            if (IsDisposed) return;
+            if (FindRowByPath(wf.CurrentPath) is not null) return;
+            _rows.Add(new WatchedRow
+            {
+                Guid = wf.Guid,
+                DisplayName = wf.DisplayName,
+                Path = wf.CurrentPath,
+                IsActiveField = true,
+                HealthField = FileHealth.Watching,
+            });
+            RefreshRowStyles();
+        });
+
+    private void OnFileReactivated(WatchedFile wf) =>
+        BeginInvoke(() =>
+        {
+            if (IsDisposed) return;
+            var row = FindRow(wf.Guid) ?? FindRowByPath(wf.CurrentPath);
+            if (row is null) return;
+            row.IsActiveField = true;
+            row.HealthField = FileHealth.Watching;
+            RefreshRowStyles();
+            UpdateButtonStates();
+        });
+
+    private void OnFileDeactivated(Guid guid) =>
+        BeginInvoke(() =>
+        {
+            if (IsDisposed) return;
+            var row = FindRow(guid);
+            if (row is not null) row.IsActiveField = false;
+            RefreshRowStyles();
+            UpdateButtonStates();
+        });
+
+    private void OnFileRemoved(Guid guid) =>
+        BeginInvoke(() =>
+        {
+            if (IsDisposed) return;
+            var row = FindRow(guid);
+            if (row is not null) _rows.Remove(row);
+        });
+
     private WatchedRow? FindRow(Guid g) => _rows.FirstOrDefault(r => r.Guid == g);
     private WatchedRow? FindRowByPath(string p) =>
         _rows.FirstOrDefault(r => string.Equals(r.Path, p, StringComparison.OrdinalIgnoreCase));
@@ -150,41 +246,12 @@ internal sealed class MainForm : Form
     {
         using var ofd = new OpenFileDialog { Multiselect = true, Title = "选择要监控的文件" };
         if (ofd.ShowDialog(this) != DialogResult.OK) return;
-        var vaultRoot = Path.GetFullPath(_config.Current.VaultRoot);
         foreach (var path in ofd.FileNames)
         {
-            var full = Path.GetFullPath(path);
-            if (full.StartsWith(@"\\", StringComparison.Ordinal))
-            {
-                MessageBox.Show(this, $"不支持网络/UNC 路径:\n{full}", "Keen", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                continue;
-            }
-            if (full.StartsWith(vaultRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(full, vaultRoot, StringComparison.OrdinalIgnoreCase))
-            {
-                MessageBox.Show(this, $"不能监控保险库内部的文件:\n{full}", "Keen", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                continue;
-            }
-            if (FindRowByPath(full) is not null) continue;
-
-            var wf = new WatchedFile
-            {
-                Guid = Guid.CreateVersion7(),
-                CurrentPath = full,
-                DisplayName = Path.GetFileName(full),
-                AddedAtTicks = DateTime.UtcNow.Ticks,
-                IsActive = true,
-            };
-            await _index.AddWatchedFileAsync(wf);
-            await _pipeline.RegisterAsync(wf.Guid, wf.CurrentPath, wf.DisplayName);
-            _watcher.Add(wf);
-            _rows.Add(new WatchedRow
-            {
-                Guid = wf.Guid,
-                DisplayName = wf.DisplayName,
-                Path = wf.CurrentPath,
-                HealthField = FileHealth.Watching,
-            });
+            var wf = await _watches.AddFileAsync(path);
+            if (wf is null)
+                MessageBox.Show(this, $"未能添加(可能是不支持的路径、在保险库内部,或非法路径):\n{path}",
+                    "Keen", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -192,13 +259,20 @@ internal sealed class MainForm : Form
     {
         if (_grid.CurrentRow?.DataBoundItem is not WatchedRow row) return;
         var ok = MessageBox.Show(this,
-            $"移除对该文件的监控?(历史版本保留)\n{row.Path}", "Keen",
+            $"移除对该文件的监控?\n历史版本会保留(主窗里灰显,「历史」仍可用)。\n{row.Path}", "Keen",
             MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
         if (ok != DialogResult.OK) return;
-        _ = _index.DeactivateWatchedFileAsync(row.Guid);
-        _pipeline.Unregister(row.Guid);
-        _watcher.Remove(row.Guid);
-        _rows.Remove(row);
+        _ = _watches.RemoveAsync(row.Guid); // FileDeactivated 会把行置灰
+    }
+
+    private void Purge()
+    {
+        if (_grid.CurrentRow?.DataBoundItem is not WatchedRow row) return;
+        var ok = MessageBox.Show(this,
+            $"彻底删除该文件的全部历史版本?\n此操作不可撤销。\n{row.DisplayName}", "Keen",
+            MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
+        if (ok != DialogResult.OK) return;
+        _ = _watches.PurgeAsync(row.Guid); // FileRemoved 会移除行
     }
 
     private void OpenSelected()
@@ -211,14 +285,34 @@ internal sealed class MainForm : Form
     private void HistorySelected()
     {
         if (_grid.CurrentRow?.DataBoundItem is not WatchedRow row) return;
-        new HistoryForm(row.Guid, row.DisplayName, row.Path, _sp) { ShowInTaskbar = false }.Show(this);
+        new HistoryForm(row.Guid, row.DisplayName, row.Path, _sp).Show();
     }
 
-    private void TogglePause()
+    // #4 双击文件列→历史;双击路径列→打开所在文件夹。
+    private void OnCellDoubleClicked(DataGridViewCellEventArgs e)
     {
-        if (_grid.CurrentRow?.DataBoundItem is not WatchedRow row) return;
-        if (row.IsPaused) { _watcher.Resume(row.Guid); row.IsPaused = false; }
-        else { _watcher.Pause(row.Guid); row.IsPaused = true; }
+        if (e.RowIndex < 0) return;
+        var row = _grid.Rows[e.RowIndex].DataBoundItem as WatchedRow;
+        if (row is null) return;
+        var col = _grid.Columns[e.ColumnIndex].Name;
+        if (col == nameof(WatchedRow.DisplayName)) HistorySelected();
+        else if (col == nameof(WatchedRow.Path)) OpenFolder(row.Path);
+    }
+
+    private static void OpenFolder(string path)
+    {
+        try { Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true }); }
+        catch { }
+    }
+
+    // #13 统计:被监控文件数、版本总数、版本合计大小。
+    private async Task StatsAsync()
+    {
+        var files = await _index.LoadAllWatchedFilesAsync();
+        var (count, size) = await _index.GetTotalsAsync();
+        MessageBox.Show(this,
+            $"被监控文件(含已移除):{files.Count}\n版本总数:{count}\n版本合计大小:{VersionRow.FormatBytes(size)}",
+            "Keen · 统计", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -231,6 +325,10 @@ internal sealed class MainForm : Form
         }
         _pipeline.VersionCaptured -= OnVersionCaptured;
         _pipeline.HealthChanged -= OnHealthChanged;
+        _watches.FileAdded -= OnFileAdded;
+        _watches.FileReactivated -= OnFileReactivated;
+        _watches.FileDeactivated -= OnFileDeactivated;
+        _watches.FileRemoved -= OnFileRemoved;
         base.OnFormClosing(e);
     }
 }
@@ -245,6 +343,8 @@ internal sealed class WatchedRow : INotifyPropertyChanged
     private long _lastTicks;
     private long _size;
     private FileHealth _health = FileHealth.Watching;
+    private bool _isPaused;
+    private bool _isActive = true;
 
     public long VersionCount
     {
@@ -266,21 +366,25 @@ internal sealed class WatchedRow : INotifyPropertyChanged
         get => _health;
         set { if (_health != value) { _health = value; On(nameof(HealthDisplay)); } }
     }
+    public bool IsActive
+    {
+        get => _isActive;
+        set { if (_isActive != value) { _isActive = value; On(nameof(HealthDisplay)); } }
+    }
 
-    // 让 MainForm 直接设底层字段而只触发一次通知(批量加载用)。
     internal long VersionCountField { get => _versionCount; set { _versionCount = value; On(nameof(VersionCount)); } }
     internal long LastCapturedTicksField { get => _lastTicks; set { _lastTicks = value; On(nameof(LastCapturedDisplay)); } }
     internal long SizeBytesField { get => _size; set { _size = value; On(nameof(SizeDisplay)); } }
     internal FileHealth HealthField { get => _health; set { _health = value; On(nameof(HealthDisplay)); } }
+    internal bool IsActiveField { get => _isActive; set { _isActive = value; On(nameof(HealthDisplay)); } }
 
     public bool IsPaused
     {
         get => _isPaused;
         set { if (_isPaused != value) { _isPaused = value; On(nameof(HealthDisplay)); } }
     }
-    private bool _isPaused;
 
-    public string HealthDisplay => IsPaused ? "已暂停" : Health switch
+    public string HealthDisplay => !IsActive ? "已移除" : IsPaused ? "已暂停" : Health switch
     {
         FileHealth.Watching => "监听中",
         FileHealth.Syncing => "存版中",

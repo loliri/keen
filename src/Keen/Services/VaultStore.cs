@@ -73,4 +73,17 @@ internal sealed class VaultStore
         try { var full = Path.Combine(_root, relPath); if (File.Exists(full)) File.Delete(full); }
         catch { /* 删除失败不影响主流程 */ }
     }
+
+    // 启动清扫:保险库里残留的 *.keenpartial(上次崩溃在写入中途留下的)。
+    public void SweepOrphans()
+    {
+        try
+        {
+            foreach (var f in Directory.EnumerateFiles(_root, "*.keenpartial", SearchOption.AllDirectories))
+            {
+                try { File.Delete(f); } catch { }
+            }
+        }
+        catch { }
+    }
 }

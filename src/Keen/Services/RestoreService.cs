@@ -5,8 +5,8 @@ namespace Keen.Services;
 
 // 可逆恢复(不变量⑧)。
 // ① 先把「当前原文件」捕进库(kind=PreRestoreSnapshot,bypass 去重)——保证恢复前的字节永远在历史里。
-// ② 把历史版本写到同目录 temp(WriteThrough + flush-to-disk),再 File.Move(overwrite) 覆盖原文件
-//    (File.Move 仅元数据原子,WriteThrough+Flush 让数据崩溃可持久)。覆盖带 SHARING_VIOLATION 重试。
+// ② 用 File.Copy(版本 blob → 原文件, overwrite) 直接覆盖;不在原文件目录留任何临时文件(不污染用户目录)。
+//    原子性由前置快照 + 版本 blob 永久在库兜底——覆盖中途崩溃,旧状态在「恢复前快照」、目标在历史 blob,重试即恢复。
 // ③ 覆盖会触发 watcher → 管线自动把恢复后的内容作为 Normal 版本入库(恢复结果留痕)。
 internal sealed class RestoreService
 {
@@ -35,42 +35,37 @@ internal sealed class RestoreService
         if (snap is null)
             throw new InvalidOperationException("无法为恢复创建前置快照(捕获失败,请查看日志)。");
 
-        // ② 写同目录 temp + 覆盖
-        var dir = Path.GetDirectoryName(origPath);
-        if (string.IsNullOrEmpty(dir)) throw new IOException("无法确定原文件所在目录。");
-        var tmp = Path.Combine(dir, $".{Path.GetFileName(origPath)}.keenrestore.{Guid.NewGuid():N}.tmp");
-
-        using (var src = new FileStream(verPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20,
-                     FileOptions.Asynchronous | FileOptions.SequentialScan))
-        using (var dst = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20,
-                     FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough))
-        {
-            await src.CopyToAsync(dst, ct);
-            await dst.FlushAsync(ct);
-            dst.Flush(flushToDisk: true);
-        }
-
-        try { await MoveWithRetryAsync(tmp, origPath, ct); }
-        catch
-        {
-            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
-            throw;
-        }
+        // ② 直接覆盖原文件(不在用户目录留临时)。
+        await CopyWithRetryAsync(verPath, origPath, ct);
 
         // ③ 刷新管线基线(快照刚落库)
         await _pipeline.ReSeedBaselineAsync(target.WatchedGuid);
     }
 
-    private static async Task MoveWithRetryAsync(string tmp, string dest, CancellationToken ct)
+    private static async Task CopyWithRetryAsync(string src, string dest, CancellationToken ct)
     {
         const int max = 6;
         for (int i = 0; i < max; i++)
         {
             ct.ThrowIfCancellationRequested();
-            try { File.Move(tmp, dest, overwrite: true); return; }
+            try { File.Copy(src, dest, overwrite: true); return; }
             catch (IOException) when (i < max - 1) { await Task.Delay(500 << i, ct); }
             catch (UnauthorizedAccessException) when (i < max - 1) { await Task.Delay(500 << i, ct); }
         }
         throw new IOException("覆盖原文件失败(可能被编辑器独占)。请关闭编辑器后重试。");
+    }
+
+    // 启动清扫:上次崩溃在恢复中途残留的 .keenrestore.*.tmp(在各原文件目录里)。
+    public static void CleanupOrphanRestoreTemps(IEnumerable<WatchedFile> files)
+    {
+        foreach (var wf in files)
+        {
+            var dir = Path.GetDirectoryName(wf.CurrentPath);
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
+            foreach (var f in Directory.EnumerateFiles(dir, "*.keenrestore.*.tmp", SearchOption.TopDirectoryOnly))
+            {
+                try { File.Delete(f); } catch { }
+            }
+        }
     }
 }

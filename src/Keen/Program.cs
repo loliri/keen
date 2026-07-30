@@ -9,15 +9,23 @@ namespace Keen;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        var addPath = ParseAddPath(args);
+
         AppPaths.Ensure();
         ApplicationConfiguration.Initialize();
+        // 跟随系统深/浅色主题(.NET 9+ WinForms 暗色模式);失败不阻塞启动。
+        try { Application.SetColorMode(SystemColorMode.System); } catch { }
 
         using var single = new SingleInstance();
         if (!single.TryAcquire())
         {
-            // 已有实例在跑;静默退出。
+            // 已有实例在跑:把 --add 的路径经命名管道转发给它,然后退出。
+            if (addPath is not null)
+            {
+                try { IpcService.SendPath(addPath); } catch { }
+            }
             return;
         }
 
@@ -33,17 +41,18 @@ internal static class Program
         try
         {
             Log.Information("Keen 启动");
-
             var config = new ConfigService();
             config.LoadAsync().GetAwaiter().GetResult();
             Directory.CreateDirectory(config.Current.VaultRoot);
 
             var store = new VaultStore(config.Current.VaultRoot);
+            store.SweepOrphans(); // 清上次崩溃在保险库残留的 .keenpartial
+
             var index = new VaultIndex(Path.Combine(config.Current.VaultRoot, "keen.sqlite"));
 
             using var services = BuildServices(config, store, index);
             using var ctx = new TrayAppContext(services);
-            ctx.StartupAsync().GetAwaiter().GetResult();
+            ctx.StartupAsync(addPath).GetAwaiter().GetResult();
             Application.Run(ctx);
         }
         catch (Exception ex)
@@ -56,6 +65,17 @@ internal static class Program
             Log.Information("Keen 退出");
             Log.CloseAndFlush();
         }
+    }
+
+    // 形如:Keen.exe --add "C:\path\file.txt"
+    private static string? ParseAddPath(string[] args)
+    {
+        for (int i = 0; i + 1 < args.Length; i++)
+        {
+            if (string.Equals(args[i], "--add", StringComparison.OrdinalIgnoreCase))
+                return args[i + 1];
+        }
+        return null;
     }
 
     private static ServiceProvider BuildServices(ConfigService config, VaultStore store, VaultIndex index)
@@ -71,7 +91,9 @@ internal static class Program
             sp.GetRequiredService<ILogger<BackupPipeline>>(),
             config.Current.SkipIdentical));
         services.AddSingleton<FileWatchService>();
+        services.AddSingleton<WatchService>();
         services.AddSingleton<RestoreService>();
+        services.AddSingleton<RetentionService>();
         services.AddSingleton<MainForm>();
         return services.BuildServiceProvider();
     }
