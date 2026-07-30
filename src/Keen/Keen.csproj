@@ -13,6 +13,12 @@
     <SelfContained>true</SelfContained>
     <PublishSingleFile>false</PublishSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
+
+    <!-- 输出规整到项目根 build\Debug 与 build\Release(去掉框架/RID 子层) -->
+    <BaseOutputPath>..\..\build\</BaseOutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <PublishDir>..\..\build\$(Configuration)\</PublishDir>
   </PropertyGroup>
 
   <ItemGroup>
