@@ -17,7 +17,6 @@ internal sealed class BackupPipeline : IDisposable
     private readonly VaultStore _store;
     private readonly VaultIndex _index;
     private readonly ILogger<BackupPipeline> _log;
-    private volatile bool _skipIdentical;
 
     private readonly SemaphoreSlim _globalThrottle = new(4);
     private readonly CancellationTokenSource _cts = new();
@@ -33,9 +32,9 @@ internal sealed class BackupPipeline : IDisposable
     // 捕获失败(重试耗尽)时触发,供通知用
     public event Action<Guid, string>? CaptureFailed;
 
-    public BackupPipeline(VaultStore store, VaultIndex index, ILogger<BackupPipeline> log, bool skipIdentical)
+    public BackupPipeline(VaultStore store, VaultIndex index, ILogger<BackupPipeline> log)
     {
-        _store = store; _index = index; _log = log; _skipIdentical = skipIdentical;
+        _store = store; _index = index; _log = log;
         _failureRetry = new Timer(_ => RetryFailures(), null,
             TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
@@ -60,8 +59,6 @@ internal sealed class BackupPipeline : IDisposable
         public string DisplayName = "";
         public string Error = "";
     }
-
-    public void SetSkipIdentical(bool value) => _skipIdentical = value;
 
     public bool IsRegistered(Guid guid) => _states.ContainsKey(guid);
 
@@ -239,7 +236,10 @@ internal sealed class BackupPipeline : IDisposable
 
                     var copy = await _store.WriteBlobAsync(src, rel, progress: null, _cts.Token);
 
-                    if (!job.BypassDedupe && _skipIdentical && st.LastSha == copy.sha256)
+                    // 内容判重(始终启用):新捕获的 SHA-256 与上一版相同 → 不落库(blob 删掉、不插行)。
+                    // 复制时哈希本来就是顺手算的,零额外成本。这挡住消费被卡后积压作业
+                    // 连发一串字节相同版本的噪音;PreRestoreSnapshot 等语义标记(bypass)不受影响。
+                    if (!job.BypassDedupe && st.LastSha == copy.sha256)
                     {
                         _store.DeleteBlob(rel);
                         st.LastTicks = ticks;

@@ -10,7 +10,6 @@ internal sealed class SettingsForm : Form
     private readonly BackupPipeline _pipeline;
     private readonly RetentionService _retention;
 
-    private readonly CheckBox _skip = new() { Text = "跳过与上次完全相同的保存(去重)", AutoSize = true };
     private readonly NumericUpDown _keep = new() { Minimum = 0, Maximum = 100000, Width = 80 };
     private readonly NumericUpDown _age = new() { Minimum = 0, Maximum = 100000, Width = 80 };
     private readonly TextBox _winMerge = new() { Width = 300 };
@@ -84,7 +83,6 @@ internal sealed class SettingsForm : Form
         _ok.Click += async (_, _) => { await SaveAsync(); DialogResult = DialogResult.OK; Close(); };
 
         panel.Controls.Add(vaultRow);
-        panel.Controls.Add(_skip);
         panel.Controls.Add(_notify);
         panel.Controls.Add(keepRow);
         panel.Controls.Add(ageRow);
@@ -96,7 +94,6 @@ internal sealed class SettingsForm : Form
 
     private void LoadValues()
     {
-        _skip.Checked = _config.Current.SkipIdentical;
         _notify.Checked = _config.Current.NotifyOnFailure;
         _keep.Value = Clamp(_config.Current.RetainKeepLast);
         _age.Value = Clamp(_config.Current.RetainMaxAgeDays);
@@ -116,7 +113,6 @@ internal sealed class SettingsForm : Form
 
     private async Task SaveAsync()
     {
-        _config.Current.SkipIdentical = _skip.Checked;
         _config.Current.NotifyOnFailure = _notify.Checked;
         _config.Current.RetainKeepLast = (int)_keep.Value;
         _config.Current.RetainMaxAgeDays = (int)_age.Value;
@@ -124,7 +120,7 @@ internal sealed class SettingsForm : Form
         var vaultChanged = _newVault is not null;
         if (vaultChanged) _config.Current.VaultRoot = _newVault!;
         await _config.SaveAsync();
-        _pipeline.SetSkipIdentical(_config.Current.SkipIdentical);
+
         if (vaultChanged)
             MessageBox.Show(
                 "保险库位置已记录,下次启动生效。\n旧保险库保留在原位;如需迁移,请手动把旧目录里的 keen.sqlite 与子文件夹复制到新位置。",

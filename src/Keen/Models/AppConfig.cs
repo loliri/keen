@@ -5,7 +5,6 @@ internal sealed class AppConfig
 {
     public string VaultRoot { get; set; } = "";
     public List<string> WatchedFiles { get; set; } = new();
-    public bool SkipIdentical { get; set; } = false;
     public bool Autostart { get; set; } = false;
 
     // 保留策略:0 = 不限

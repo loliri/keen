@@ -88,8 +88,7 @@ internal static class Program
         services.AddSingleton<BackupPipeline>(sp => new BackupPipeline(
             sp.GetRequiredService<VaultStore>(),
             sp.GetRequiredService<VaultIndex>(),
-            sp.GetRequiredService<ILogger<BackupPipeline>>(),
-            config.Current.SkipIdentical));
+            sp.GetRequiredService<ILogger<BackupPipeline>>()));
         services.AddSingleton<FileWatchService>();
         services.AddSingleton<WatchService>();
         services.AddSingleton<RestoreService>();
