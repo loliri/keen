@@ -77,9 +77,9 @@ internal sealed class SettingsForm : Form
 
         _pruneNow.Click += async (_, _) =>
         {
-            await SaveAsync();
-            await _retention.RunAsync();
-            MessageBox.Show("已按当前策略清理一次。", "Keen");
+            // 只按当前 UI 值跑清理,不保存任何设置(保存只属于「确定」;X = 取消的语义不能被这个按钮破坏)
+            await _retention.RunAsync((int)_keep.Value, (int)_age.Value);
+            MessageBox.Show("已按当前策略清理一次(未保存设置)。", "Keen");
         };
         _ok.Click += async (_, _) => { await SaveAsync(); DialogResult = DialogResult.OK; Close(); };
 

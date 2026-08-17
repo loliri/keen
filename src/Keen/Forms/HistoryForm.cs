@@ -29,7 +29,7 @@ internal sealed class HistoryForm : Form
     private readonly Button _compareBtn = new() { Text = "对比(WinMerge)" };
     private readonly Button _refresh = new() { Text = "刷新" };
 
-    public HistoryForm(Guid guid, string displayName, string origPath, IServiceProvider sp)
+    public HistoryForm(Guid guid, string displayName, IServiceProvider sp)
     {
         _guid = guid; _displayName = displayName; _sp = sp;
         _index = sp.GetRequiredService<VaultIndex>();
@@ -130,9 +130,11 @@ internal sealed class HistoryForm : Form
         ApplyFilter();
     }
 
-    // #11 筛选:按备注 / 时间 / 类型文本包含(空=全部)。
+    // #11 筛选:按备注 / 时间 / 类型文本包含(空=全部)。重建行后恢复原选中,
+    // 否则 CurrentRow 重置到第 0 行,恢复/对比会作用在非用户所选的版本上。
     private void ApplyFilter()
     {
+        var prevId = (_grid.CurrentRow?.DataBoundItem as VersionRow)?.Entry.Id ?? 0;
         var q = (_filter.Text ?? "").Trim();
         var deltaMap = ComputeDeltas();
         _rows.Clear();
@@ -147,6 +149,19 @@ internal sealed class HistoryForm : Form
                     continue;
             }
             _rows.Add(new VersionRow { Entry = v, DeltaBytes = deltaMap.GetValueOrDefault(v.Id) });
+        }
+        if (prevId != 0)
+        {
+            for (int i = 0; i < _grid.Rows.Count; i++)
+            {
+                if (_grid.Rows[i].DataBoundItem is VersionRow vr && vr.Entry.Id == prevId)
+                {
+                    _grid.ClearSelection();
+                    _grid.Rows[i].Selected = true;
+                    _grid.CurrentCell = _grid.Rows[i].Cells[0];
+                    break;
+                }
+            }
         }
     }
 
@@ -193,8 +208,9 @@ internal sealed class HistoryForm : Form
     private async Task RestoreAsync()
     {
         if (SelectedOne() is not { } e) return;
+        var when = new DateTime(e.CapturedAtTicks, DateTimeKind.Utc).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
         var ok = MessageBox.Show(this,
-            "恢复会把所选历史版本覆盖回原文件。\n\n当前的原文件会先自动存进历史(作为「恢复前快照」),\n所以这一步可以再撤销。\n\n确定恢复?",
+            $"恢复到所选版本?\n\n版本:{when}(大小 {VersionRow.FormatBytes(e.SizeBytes)})\n\n当前的原文件会先自动存进历史(作为「恢复前快照」),\n所以这一步可以再撤销。\n\n确定恢复?",
             "Keen · 恢复", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
         if (ok != DialogResult.OK) return;
 

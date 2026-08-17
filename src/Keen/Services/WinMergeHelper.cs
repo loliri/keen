@@ -88,14 +88,14 @@ internal static class WinMergeHelper
             }
         }
 
-        // UninstallString 形如 "\"C:\...\unins000.exe\"" —— 取其目录。
+        // UninstallString 形如 "\"C:\...\unins000.exe\"" —— "unins" 之前的段就是安装目录本身。
         if (sk.GetValue("UninstallString") is string un && !string.IsNullOrWhiteSpace(un))
         {
             var p = un.Trim().Trim('"');
             var idx = p.IndexOf("unins", StringComparison.OrdinalIgnoreCase);
             if (idx > 0)
             {
-                var dir = Path.GetDirectoryName(p[..idx].TrimEnd('\\', '"', ' '));
+                var dir = p[..idx].TrimEnd('\\', '"', ' ');
                 if (!string.IsNullOrEmpty(dir))
                 {
                     var exe = Path.Combine(dir, "WinMergeU.exe");

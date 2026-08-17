@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Keen.Models;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Timer = System.Threading.Timer;
 
@@ -10,7 +11,7 @@ namespace Keen.Services;
 // ① 500ms 尾沿防抖 → ② 写静止/锁重试(20 次 ~30s)+ FileId 校验打开 → ④ 流复制+SHA256 → ⑤ 持久落库+插索引。
 // 消费循环内 try/catch,单个坏作业不杀消费线程。
 // CaptureDirectAsync:供恢复(PreRestoreSnapshot)等需要同步等待结果的特殊作业用,走同一通道串行。
-// 失败标记(#3):重试耗尽的作业留 marker,由 _failureRetry 定时重投,补 AV 锁静默丢版的洞。
+// 失败标记:重试耗尽的作业留 marker,由 _failureRetry 定时重投,补 AV 锁静默丢版的洞。
 internal sealed class BackupPipeline : IDisposable
 {
     private readonly VaultStore _store;
@@ -22,6 +23,7 @@ internal sealed class BackupPipeline : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<Guid, FileState> _states = new();
     private readonly ConcurrentDictionary<Guid, Timer> _debounce = new();
+    private readonly object _debounceLock = new(); // FSW 事件并发触发时保证防抖 timer 换装原子
     private readonly Random _jitter = new();
     private readonly ConcurrentDictionary<Guid, FailureMarker> _failures = new();
     private readonly Timer _failureRetry;
@@ -61,6 +63,18 @@ internal sealed class BackupPipeline : IDisposable
 
     public void SetSkipIdentical(bool value) => _skipIdentical = value;
 
+    public bool IsRegistered(Guid guid) => _states.ContainsKey(guid);
+
+    // 同目录改名跟踪:更新管线内的路径/显示名(不动通道与消费者)。
+    public void UpdatePath(Guid guid, string path, string displayName)
+    {
+        if (_states.TryGetValue(guid, out var st))
+        {
+            st.Path = path;
+            st.DisplayName = displayName;
+        }
+    }
+
     public async Task RegisterAsync(Guid guid, string path, string displayName)
     {
         if (_states.ContainsKey(guid)) return;
@@ -90,22 +104,34 @@ internal sealed class BackupPipeline : IDisposable
         if (_states.TryGetValue(guid, out var st)) await ReSeedStateAsync(st);
     }
 
-    public void Unregister(Guid guid)
+    // 停止某文件:关通道(拒新作业)→ 等在途作业排空(带超时)→ 移除状态。
+    // 移除是关键:否则重新 RegisterAsync 会因 ContainsKey 早退,留下打不进作业的死通道(评审致命#1)。
+    public async Task StopFileAsync(Guid guid, TimeSpan drainTimeout)
     {
-        if (_states.TryGetValue(guid, out var st)) st.Channel.Writer.TryComplete();
+        if (_debounce.TryRemove(guid, out var t)) t.Dispose();
+        if (_states.TryRemove(guid, out var st))
+        {
+            st.Channel.Writer.TryComplete();
+            try { await Task.WhenAny(st.Consumer, Task.Delay(drainTimeout)); }
+            catch { }
+        }
         _failures.TryRemove(guid, out _);
     }
 
     public void OnFileChanged(Guid guid)
     {
         if (!_states.TryGetValue(guid, out var st)) return;
-        if (_debounce.TryGetValue(guid, out var prev)) prev.Dispose();
         var path = st.Path;
         var name = st.DisplayName;
-        var t = new Timer(_ =>
-            Enqueue(new BackupJob { WatchedGuid = guid, SourcePath = path, DisplayName = name }),
-            null, 500, Timeout.Infinite);
-        _debounce[guid] = t;
+        Timer t;
+        lock (_debounceLock)
+        {
+            if (_debounce.TryGetValue(guid, out var prev)) prev.Dispose();
+            t = new Timer(_ =>
+                Enqueue(new BackupJob { WatchedGuid = guid, SourcePath = path, DisplayName = name }),
+                null, 500, Timeout.Infinite);
+            _debounce[guid] = t;
+        }
     }
 
     public void EnqueueCatchup(Guid guid, string path, string displayName)
@@ -114,7 +140,10 @@ internal sealed class BackupPipeline : IDisposable
     public void Enqueue(BackupJob job)
     {
         if (_states.TryGetValue(job.WatchedGuid, out var st))
-            st.Channel.Writer.TryWrite(job);
+        {
+            if (!st.Channel.Writer.TryWrite(job))
+                _log.LogWarning("队列已满,丢弃 {Guid} 的作业(消费者被长时间阻塞)", job.WatchedGuid);
+        }
     }
 
     public async Task<VersionEntry?> CaptureDirectAsync(Guid guid, string path, string displayName,
@@ -183,7 +212,9 @@ internal sealed class BackupPipeline : IDisposable
                         return null;
                     }
 
-                    if (info.Length > 100L << 20 && attempt == 0)
+                    // 大文件(>100MB)写静止:2 样本长度稳定,≥1s。每次尝试都查,
+                    // 否则增长中的文件会在第 2 次尝试被中途开抄(评审撕裂版洞)。
+                    if (info.Length > 100L << 20)
                     {
                         long s1 = info.Length;
                         await Task.Delay(1000, _cts.Token);
@@ -232,10 +263,23 @@ internal sealed class BackupPipeline : IDisposable
                     return null;
                 }
                 catch (OperationCanceledException) { throw; }
-                catch (StaleHandleException) when (attempt < maxAttempts - 1) { await Task.Delay(DelayFor(attempt), _cts.Token); }
-                catch (IOException ex) when (attempt < maxAttempts - 1)
+                // 注意:不加 when(attempt<max-1) 过滤——最后一次尝试的异常必须落到循环外的
+                // 「重试耗尽」路径(写失败标记 + 通知),否则失败标记机制被整个绕过(评审高危#2)。
+                catch (StaleHandleException)
                 {
+                    if (attempt >= maxAttempts - 1) break;
+                    await Task.Delay(DelayFor(attempt), _cts.Token);
+                }
+                catch (IOException ex)
+                {
+                    if (attempt >= maxAttempts - 1) break;
                     _log.LogWarning("捕获重试 {Guid} attempt {A}: {Msg}", st.Guid, attempt, ex.Message);
+                    await Task.Delay(DelayFor(attempt), _cts.Token);
+                }
+                catch (SqliteException ex)
+                {
+                    if (attempt >= maxAttempts - 1) break;
+                    _log.LogWarning("索引写入重试 {Guid} attempt {A}: {Msg}", st.Guid, attempt, ex.Message);
                     await Task.Delay(DelayFor(attempt), _cts.Token);
                 }
             }

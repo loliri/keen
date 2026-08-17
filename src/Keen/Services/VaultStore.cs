@@ -66,7 +66,8 @@ internal sealed class VaultStore
         return (total, BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant());
     }
 
-    public string FullPath(string relPath) => Path.Combine(_root, relPath);
+    // relPath 在库里以 `/` 分隔存储(guid/YYYY-MM/文件);explorer /select 认不了混合斜杠路径,统一规范化成 `\`。
+    public string FullPath(string relPath) => Path.GetFullPath(Path.Combine(_root, relPath));
 
     public void DeleteBlob(string relPath)
     {

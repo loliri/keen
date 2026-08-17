@@ -4,8 +4,9 @@ using Timer = System.Threading.Timer;
 
 namespace Keen.Services;
 
-// 保留策略清理(#1):按 config 的 keepLast / maxAgeDays 删旧版本(blob + DB 行)。
-// 启动后 10 分钟首跑,之后每 12 小时;也可由设置窗「立即清理一次」手动触发。默认两个都 0=不限。
+// 保留策略清理(#1):按 keepLast / maxAgeDays 删旧版本(blob + DB 行)。
+// 启动后 10 分钟首跑,之后每 12 小时;也可由设置窗「立即清理一次」带参数手动触发。
+// 作用于全部文件(含已停止监控的)——否则停止文件的 blob 永远不被清理,库无限膨胀。
 internal sealed class RetentionService : IDisposable
 {
     private readonly VaultIndex _index;
@@ -21,13 +22,15 @@ internal sealed class RetentionService : IDisposable
     }
 
     public async Task RunAsync()
+        => await RunAsync(_config.Current.RetainKeepLast, _config.Current.RetainMaxAgeDays);
+
+    // 带参数版本:设置窗「立即清理一次」用当前 UI 值跑,不落盘任何设置。
+    public async Task RunAsync(int keep, int age)
     {
-        var keep = _config.Current.RetainKeepLast;
-        var age = _config.Current.RetainMaxAgeDays;
         if (keep <= 0 && age <= 0) return;
         try
         {
-            var files = await _index.LoadActiveWatchedFilesAsync();
+            var files = await _index.LoadAllWatchedFilesAsync();
             int total = 0;
             foreach (var wf in files)
             {

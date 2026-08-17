@@ -38,7 +38,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
         var menu = new ContextMenuStrip();
         menu.Items.Add("显示主窗(&S)", image: null, (_, _) => ShowMain());
-        menu.Items.Add("设置(&E)…", image: null, (_, _) => new SettingsForm(_services).ShowDialog());
+        menu.Items.Add("设置(&E)…", image: null, (_, _) => { using var f = new SettingsForm(_services); f.ShowDialog(); });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_autoItem);
         menu.Items.Add(_shellItem);
@@ -77,9 +77,13 @@ internal sealed class TrayAppContext : ApplicationContext
         pipeline.HealthChanged += OnHealth;
         pipeline.CaptureFailed += OnCaptureFailed;
 
+        // IPC 服务先起:武装完成前右键 --add 才连得上管道,不至于被静默丢
+        _ipcTask = Task.Run(() => IpcService.RunServerAsync(OnIpcPath, _ipcCts.Token));
+
         await watches.InitializeAsync();
 
-        _ipcTask = Task.Run(() => IpcService.RunServerAsync(OnIpcPath, _ipcCts.Token));
+        // 强制构造 RetentionService:DI 懒加载单例不解析就永不实例化,保留策略的定时器从未启动过
+        _ = _services.GetRequiredService<RetentionService>();
 
         if (addPath is not null)
         {
@@ -90,7 +94,21 @@ internal sealed class TrayAppContext : ApplicationContext
     private async Task OnIpcPath(string path)
     {
         var watches = _services.GetRequiredService<WatchService>();
-        try { await watches.AddFileAsync(path); } catch { }
+        string? err = null;
+        try
+        {
+            var wf = await watches.AddFileAsync(path);
+            if (wf is null) err = "路径不支持、在保险库内或已存在";
+        }
+        catch (Exception ex) { err = ex.Message; }
+        if (err is not null)
+        {
+            _ui.Post(_ =>
+            {
+                try { _tray.ShowBalloonTip(5000, "Keen:添加监控失败", $"{path}\n{err}", ToolTipIcon.Warning); }
+                catch { }
+            }, null);
+        }
     }
 
     private void OnHealth(Guid guid, FileHealth h, string? msg) =>

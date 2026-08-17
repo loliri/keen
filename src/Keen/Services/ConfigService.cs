@@ -27,9 +27,12 @@ internal sealed class ConfigService
                 var json = await File.ReadAllTextAsync(AppPaths.ConfigFile);
                 Current = JsonSerializer.Deserialize<AppConfig>(json) ?? new AppConfig();
             }
-            catch
+            catch (Exception ex)
             {
-                // 损坏的 config 不能阻塞启动;落到默认。
+                // 损坏的 config 不能阻塞启动,但也不能无声重置(会把迁移过的保险库指回默认空库)。
+                // 改名保留现场 + 记错误日志,再落默认。
+                try { File.Move(AppPaths.ConfigFile, AppPaths.ConfigFile + ".corrupt", overwrite: true); } catch { }
+                Serilog.Log.Error(ex, "config.json 损坏,已保留为 config.json.corrupt 并使用默认配置");
                 Current = new AppConfig();
             }
 
