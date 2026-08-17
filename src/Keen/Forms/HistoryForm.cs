@@ -64,6 +64,14 @@ internal sealed class HistoryForm : Form
         };
         filterRow.Controls.Add(new Label { Text = "筛选:", AutoSize = true, Margin = new Padding(0, 8, 6, 0) });
         filterRow.Controls.Add(_filter);
+        // 说明:单选「对比」的基准取完整历史的上一版(语义正确),筛选时可能看不见——明说,免困惑
+        filterRow.Controls.Add(new Label
+        {
+            Text = "单选「对比」的基准是完整历史里的上一版,可能被当前筛选隐藏",
+            AutoSize = true,
+            ForeColor = Color.Gray,
+            Margin = new Padding(12, 8, 0, 0),
+        });
 
         var bar = new FlowLayoutPanel
         {
