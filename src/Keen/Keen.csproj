@@ -8,11 +8,12 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Version>0.1.0</Version>
 
-    <!-- 自包含多文件(可差量更新:只换变化的 DLL,通常 Keen.dll);WinForms 不可裁剪 -->
+    <!-- 框架依赖多文件(本机/目标机需 .NET 10 运行时)。公开发布自包含包时手动执行:
+         dotnet publish -c Release -p:SelfContained=true -->
+    <!-- RID 只用于挑选 SQLite 等原生库的对应架构(否则 23 个平台的原生库全拷进来);
+         SelfContained=false 时它不构成自包含 -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <SelfContained>true</SelfContained>
     <PublishSingleFile>false</PublishSingleFile>
-    <PublishTrimmed>false</PublishTrimmed>
 
     <!-- 输出规整到项目根 build\Debug 与 build\Release(去掉框架/RID 子层) -->
     <BaseOutputPath>..\..\build\</BaseOutputPath>

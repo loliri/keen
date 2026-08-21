@@ -119,10 +119,16 @@ FSW 事件
 
 ```bash
 dotnet build                # → build\Debug\
-dotnet publish -c Release   # → build\Release\（自包含多文件）
+dotnet publish -c Release   # → build\Release\（框架依赖多文件，需目标机有 .NET 10 运行时）
 ```
 
-产物为**多文件自包含**形态（非单文件）：更新时只需替换变化的文件（通常只有 `Keen.dll`），便于增量更新。
+默认**框架依赖**；要出给别人用的自包含完整包（无需另装运行时）：
+
+```bash
+dotnet publish -c Release --self-contained -r win-x64
+```
+
+两种都是多文件形态（非单文件）：更新时只需替换变化的文件（通常只有 `Keen.dll`），便于增量更新。
 
 ---
 
